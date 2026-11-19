@@ -122,46 +122,67 @@ func (ctx fsRegistrationContext) apfsIoDevice(device string) (string, bool) {
 	return physical, ok
 }
 
+// resolveIoDevice maps a mounted device to its diskIoCounters key, in order:
+//  1. an exact match on the device name;
+//  2. the physical disk behind an APFS volume on darwin, which must come
+//     before name matching because the container disk's number is unrelated
+//     to the physical disk's and can prefix-match the wrong one (disk1 is a
+//     prefix of disk13s1);
+//  3. name matching (exact device or label, then prefix) via findIoDevice;
+//  4. name matching on the device's symlink target, e.g. LVM's /dev/vg/lv
+//     -> dm-N.
+func (ctx fsRegistrationContext) resolveIoDevice(device string) (string, bool) {
+	if name := normalizeDeviceName(device); name != "" {
+		if _, ok := ctx.diskIoCounters[name]; ok {
+			return name, true
+		}
+	}
+	if physical, ok := ctx.apfsIoDevice(device); ok {
+		return physical, true
+	}
+	if key, ok := findIoDevice(device, ctx.diskIoCounters); ok {
+		return key, true
+	}
+	if target := ctx.symlinkTarget(device); target != "" {
+		return findIoDevice(target, ctx.diskIoCounters)
+	}
+	return "", false
+}
+
+// symlinkTarget returns the base name of a device path's symlink target when
+// it differs from the device's own base name, or "".
+//
+// Device-mapper mounts appear as symlinked paths like /dev/vg/lv whose base
+// name matches neither the diskstats name (dm-N) nor the dm label (vg-lv); the
+// resolved target's base is one of those existing names. Bare names (folder
+// devices, ZFS datasets) are skipped because they would resolve relative to
+// the agent's working directory.
+func (ctx fsRegistrationContext) symlinkTarget(device string) string {
+	if ctx.isWindows || !filepath.IsAbs(device) {
+		return ""
+	}
+	resolved, err := evalSymlinks(device)
+	if err != nil {
+		return ""
+	}
+	if base := filepath.Base(resolved); base != filepath.Base(device) {
+		return base
+	}
+	return ""
+}
+
 // registerFilesystemStats resolves the tracked key and stats payload for a
 // filesystem before it is inserted into fsStats.
 func registerFilesystemStats(existing map[string]*system.FsStats, device, mountpoint string, root bool, customName string, ctx fsRegistrationContext) (string, *system.FsStats, bool) {
 	key := device
-	resolvedKey := ""
 	if !ctx.isWindows {
 		key = filepath.Base(device)
-		// Device-mapper mounts appear as symlinked paths like /dev/vg/lv whose
-		// base name matches neither the diskstats name (dm-N) nor the dm label
-		// (vg-lv); the resolved target's base is one of those existing names.
-		// Bare names (folder devices, ZFS datasets) are skipped because they
-		// would resolve relative to the agent's working directory.
-		if filepath.IsAbs(device) {
-			if resolved, err := evalSymlinks(device); err == nil {
-				if base := filepath.Base(resolved); base != key {
-					resolvedKey = base
-				}
-			}
-		}
-		// APFS volumes sit on a synthesized container disk (disk13s1 in
-		// container disk13) that IOKit reports no counters for, and whose
-		// number is unrelated to the physical disk (disk12). Resolve the
-		// physical store up front so the prefix fallback below can't pick an
-		// unrelated disk (disk1 is a prefix of disk13s1).
-		if _, ioMatch := ctx.diskIoCounters[key]; !ioMatch {
-			if physical, ok := ctx.apfsIoDevice(device); ok {
-				key = physical
-			}
-		}
 	}
 
-	if root {
-		// Try to map root device to a diskIoCounters entry. First checks for an
-		// exact key match, then uses findIoDevice for normalized / prefix-based
-		// matching (e.g. nda0p2 -> nda0) and the symlink-resolved device name,
-		// and finally falls back to FILESYSTEM.
-		if _, ioMatch := ctx.diskIoCounters[key]; !ioMatch {
-			if matchedKey, match := findIoDevice(key, ctx.diskIoCounters); match {
-				key = matchedKey
-			} else if matchedKey, match := findIoDevice(resolvedKey, ctx.diskIoCounters); match {
+	if _, ioMatch := ctx.diskIoCounters[key]; !ioMatch {
+		if root {
+			// Fall back to FILESYSTEM if the root device itself can't be mapped.
+			if matchedKey, match := ctx.resolveIoDevice(device); match {
 				key = matchedKey
 			} else if ctx.filesystem != "" {
 				if matchedKey, match := findIoDevice(ctx.filesystem, ctx.diskIoCounters); match {
@@ -171,12 +192,10 @@ func registerFilesystemStats(existing map[string]*system.FsStats, device, mountp
 			if _, ioMatch = ctx.diskIoCounters[key]; !ioMatch {
 				slog.Warn("Root I/O unmapped; set FILESYSTEM", "device", device, "mountpoint", mountpoint)
 			}
-		}
-	} else {
-		// Check if non-root has diskstats and prefer the folder device for
-		// /extra-filesystems mounts when the discovered partition device is a
-		// mapper path (e.g. luks UUID) that obscures the underlying block device.
-		if _, ioMatch := ctx.diskIoCounters[key]; !ioMatch {
+		} else {
+			// Prefer the folder device for /extra-filesystems mounts when the
+			// discovered partition device is a mapper path (e.g. luks UUID) that
+			// obscures the underlying block device.
 			if strings.HasPrefix(mountpoint, ctx.efPath) {
 				folderDevice, _ := parseFilesystemEntry(filepath.Base(mountpoint))
 				if folderDevice != "" {
@@ -186,9 +205,7 @@ func registerFilesystemStats(existing map[string]*system.FsStats, device, mountp
 				}
 			}
 			if _, ioMatch = ctx.diskIoCounters[key]; !ioMatch {
-				if matchedKey, match := findIoDevice(key, ctx.diskIoCounters); match {
-					key = matchedKey
-				} else if matchedKey, match := findIoDevice(resolvedKey, ctx.diskIoCounters); match {
+				if matchedKey, match := ctx.resolveIoDevice(device); match {
 					key = matchedKey
 				}
 			}
@@ -258,18 +275,10 @@ func isRootFallbackPartition(p disk.PartitionStat, rootMountPoint string) bool {
 // partition looks like the active root mount but still needs translating to an
 // I/O device key.
 func (d *diskDiscovery) addPartitionRootFs(device, mountpoint string) bool {
-	// device is passed through as-is: findIoDevice normalizes it, and
+	// device is passed through as-is: resolveIoDevice normalizes it, and
 	// filepath.Base would turn a Windows volume name such as "C:" into "\"
 	// on the way in (#2417).
-	// An APFS root (e.g. disk3s1s1 on Apple Silicon) never prefix-matches its
-	// physical disk (disk0), so resolve it before the generic lookup.
-	fs, match := "", false
-	if _, exact := d.ctx.diskIoCounters[normalizeDeviceName(device)]; !exact {
-		fs, match = d.ctx.apfsIoDevice(device)
-	}
-	if !match {
-		fs, match = findIoDevice(device, d.ctx.diskIoCounters)
-	}
+	fs, match := d.ctx.resolveIoDevice(device)
 	if !match {
 		return false
 	}

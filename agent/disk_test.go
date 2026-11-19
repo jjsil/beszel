@@ -1400,3 +1400,108 @@ func TestAddPartitionRootFsAPFS(t *testing.T) {
 		d.addPartitionRootFs("/dev/disk3s1s1", "/")
 	})
 }
+
+func TestResolveIoDevice(t *testing.T) {
+	counters := map[string]disk.IOCountersStat{
+		"disk1":  {Name: "disk1", ReadBytes: 9000, WriteBytes: 9000},
+		"disk12": {Name: "disk12"},
+		"dm-1":   {Name: "dm-1", Label: "vg1-volume_1"},
+		"sda":    {Name: "sda"},
+	}
+	noAPFS := func(string) string { return "" }
+
+	tests := []struct {
+		name     string
+		ctx      fsRegistrationContext
+		device   string
+		apfs     func(string) string
+		symlinks func(string) (string, error)
+		want     string
+		wantOK   bool
+	}{
+		{
+			name:   "exact match wins over every lookup",
+			ctx:    fsRegistrationContext{isDarwin: true, diskIoCounters: counters},
+			device: "/dev/sda",
+			apfs:   func(string) string { t.Fatal("APFS lookup should not run"); return "" },
+			want:   "sda", wantOK: true,
+		},
+		{
+			name:   "apfs store beats a false prefix match",
+			ctx:    fsRegistrationContext{isDarwin: true, diskIoCounters: counters},
+			device: "/dev/disk13s1",
+			apfs:   func(string) string { return "disk12" },
+			want:   "disk12", wantOK: true,
+		},
+		{
+			name:   "prefix match when apfs lookup is unresolved",
+			ctx:    fsRegistrationContext{isDarwin: true, diskIoCounters: counters},
+			device: "/dev/sda1",
+			apfs:   noAPFS,
+			want:   "sda", wantOK: true,
+		},
+		{
+			name:     "symlink target when names don't match",
+			ctx:      fsRegistrationContext{diskIoCounters: counters},
+			device:   "/dev/vg1/volume_1",
+			apfs:     noAPFS,
+			symlinks: func(string) (string, error) { return "/dev/dm-1", nil },
+			want:     "dm-1", wantOK: true,
+		},
+		{
+			name:     "symlinks skipped for bare names",
+			ctx:      fsRegistrationContext{diskIoCounters: counters},
+			device:   "tank/data",
+			apfs:     noAPFS,
+			symlinks: func(string) (string, error) { t.Fatal("symlink lookup should not run"); return "", nil },
+			wantOK:   false,
+		},
+		{
+			name:     "symlinks skipped on windows",
+			ctx:      fsRegistrationContext{isWindows: true, diskIoCounters: counters},
+			device:   `\\?\Volume{1234}`,
+			apfs:     noAPFS,
+			symlinks: func(string) (string, error) { t.Fatal("symlink lookup should not run"); return "", nil },
+			wantOK:   false,
+		},
+		{
+			name:     "no match",
+			ctx:      fsRegistrationContext{diskIoCounters: counters},
+			device:   "/dev/nvme0n1p1",
+			apfs:     noAPFS,
+			symlinks: func(p string) (string, error) { return p, nil },
+			wantOK:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setApfsPhysicalDisk(t, tt.apfs)
+			if tt.symlinks != nil {
+				setEvalSymlinks(t, tt.symlinks)
+			}
+			got, ok := tt.ctx.resolveIoDevice(tt.device)
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestAddPartitionRootFsSymlink(t *testing.T) {
+	// Root on LVM: /dev/vg0/root has no name match; its target dm-0 does.
+	// Previously this fell through to addLastResortRootFs.
+	setEvalSymlinks(t, func(string) (string, error) { return "/dev/dm-0", nil })
+	agent := &Agent{fsStats: make(map[string]*system.FsStats)}
+	d := diskDiscovery{
+		agent:          agent,
+		rootMountPoint: "/",
+		ctx: fsRegistrationContext{diskIoCounters: map[string]disk.IOCountersStat{
+			"dm-0": {Name: "dm-0"},
+			"sdb":  {Name: "sdb", ReadBytes: 9000},
+		}},
+	}
+
+	assert.True(t, d.addPartitionRootFs("/dev/vg0/root", "/"))
+	stats, ok := agent.fsStats["dm-0"]
+	require.True(t, ok, "root should map to dm-0, got %v", agent.fsStats)
+	assert.True(t, stats.Root)
+}
