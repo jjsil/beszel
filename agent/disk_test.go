@@ -1505,3 +1505,25 @@ func TestAddPartitionRootFsSymlink(t *testing.T) {
 	require.True(t, ok, "root should map to dm-0, got %v", agent.fsStats)
 	assert.True(t, stats.Root)
 }
+
+func TestIoMatchCandidateBusierThan(t *testing.T) {
+	base := ioMatchCandidate{name: "sdb", bytes: 100, ops: 10}
+	tests := []struct {
+		name string
+		c    ioMatchCandidate
+		want bool
+	}{
+		{"more bytes wins", ioMatchCandidate{name: "sdz", bytes: 101, ops: 1}, true},
+		{"fewer bytes loses", ioMatchCandidate{name: "sda", bytes: 99, ops: 99}, false},
+		{"equal bytes, more ops wins", ioMatchCandidate{name: "sdz", bytes: 100, ops: 11}, true},
+		{"equal bytes, fewer ops loses", ioMatchCandidate{name: "sda", bytes: 100, ops: 9}, false},
+		{"full tie, lower name wins", ioMatchCandidate{name: "sda", bytes: 100, ops: 10}, true},
+		{"full tie, higher name loses", ioMatchCandidate{name: "sdc", bytes: 100, ops: 10}, false},
+		{"identical is not busier", base, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.c.busierThan(base))
+		})
+	}
+}

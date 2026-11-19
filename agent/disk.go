@@ -123,24 +123,22 @@ func (ctx fsRegistrationContext) apfsIoDevice(device string) (string, bool) {
 }
 
 // resolveIoDevice maps a mounted device to its diskIoCounters key, in order:
-//  1. an exact match on the device name;
+//  1. an exact match on the device name or label;
 //  2. the physical disk behind an APFS volume on darwin, which must come
 //     before name matching because the container disk's number is unrelated
 //     to the physical disk's and can prefix-match the wrong one (disk1 is a
 //     prefix of disk13s1);
-//  3. name matching (exact device or label, then prefix) via findIoDevice;
+//  3. a prefix match, choosing the most active candidate;
 //  4. name matching on the device's symlink target, e.g. LVM's /dev/vg/lv
 //     -> dm-N.
 func (ctx fsRegistrationContext) resolveIoDevice(device string) (string, bool) {
-	if name := normalizeDeviceName(device); name != "" {
-		if _, ok := ctx.diskIoCounters[name]; ok {
-			return name, true
-		}
+	if key, ok := exactIoDevice(device, ctx.diskIoCounters); ok {
+		return key, true
 	}
 	if physical, ok := ctx.apfsIoDevice(device); ok {
 		return physical, true
 	}
-	if key, ok := findIoDevice(device, ctx.diskIoCounters); ok {
+	if key, ok := prefixIoDevice(device, ctx.diskIoCounters); ok {
 		return key, true
 	}
 	if target := ctx.symlinkTarget(device); target != "" {
@@ -519,40 +517,46 @@ type ioMatchCandidate struct {
 // findIoDevice prefers exact device/label matches, then falls back to a
 // prefix-related candidate with the highest recent activity.
 func findIoDevice(filesystem string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
+	if name, ok := exactIoDevice(filesystem, diskIoCounters); ok {
+		return name, true
+	}
+	return prefixIoDevice(filesystem, diskIoCounters)
+}
+
+// exactIoDevice returns the device whose normalized name or label equals the
+// normalized filesystem.
+func exactIoDevice(filesystem string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
 	filesystem = normalizeDeviceName(filesystem)
 	if filesystem == "" {
 		return "", false
 	}
-
-	candidates := []ioMatchCandidate{}
-
 	for _, d := range diskIoCounters {
 		if normalizeDeviceName(d.Name) == filesystem || (d.Label != "" && normalizeDeviceName(d.Label) == filesystem) {
 			return d.Name, true
 		}
-		if prefixRelated(normalizeDeviceName(d.Name), filesystem) ||
-			(d.Label != "" && prefixRelated(normalizeDeviceName(d.Label), filesystem)) {
-			candidates = append(candidates, ioMatchCandidate{
-				name:  d.Name,
-				bytes: d.ReadBytes + d.WriteBytes,
-				ops:   d.ReadCount + d.WriteCount,
-			})
-		}
 	}
+	return "", false
+}
 
-	if len(candidates) == 0 {
+// prefixIoDevice returns the most active device whose name or label is
+// prefix-related to the filesystem (e.g. nda0p2 -> nda0).
+func prefixIoDevice(filesystem string, diskIoCounters map[string]disk.IOCountersStat) (string, bool) {
+	filesystem = normalizeDeviceName(filesystem)
+	if filesystem == "" {
 		return "", false
 	}
-
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.bytes > best.bytes ||
-			(c.bytes == best.bytes && c.ops > best.ops) ||
-			(c.bytes == best.bytes && c.ops == best.ops && c.name < best.name) {
-			best = c
+	var best ioMatchCandidate
+	for _, d := range diskIoCounters {
+		if prefixRelated(normalizeDeviceName(d.Name), filesystem) ||
+			(d.Label != "" && prefixRelated(normalizeDeviceName(d.Label), filesystem)) {
+			if c := newIoMatchCandidate(d); best.name == "" || c.busierThan(best) {
+				best = c
+			}
 		}
 	}
-
+	if best.name == "" {
+		return "", false
+	}
 	slog.Info("Using disk I/O fallback", "requested", filesystem, "selected", best.name)
 	return best.name, true
 }
@@ -562,18 +566,31 @@ func findIoDevice(filesystem string, diskIoCounters map[string]disk.IOCountersSt
 func mostActiveIoDevice(diskIoCounters map[string]disk.IOCountersStat) string {
 	var best ioMatchCandidate
 	for _, d := range diskIoCounters {
-		c := ioMatchCandidate{
-			name:  d.Name,
-			bytes: d.ReadBytes + d.WriteBytes,
-			ops:   d.ReadCount + d.WriteCount,
-		}
-		if best.name == "" || c.bytes > best.bytes ||
-			(c.bytes == best.bytes && c.ops > best.ops) ||
-			(c.bytes == best.bytes && c.ops == best.ops && c.name < best.name) {
+		if c := newIoMatchCandidate(d); best.name == "" || c.busierThan(best) {
 			best = c
 		}
 	}
 	return best.name
+}
+
+func newIoMatchCandidate(d disk.IOCountersStat) ioMatchCandidate {
+	return ioMatchCandidate{
+		name:  d.Name,
+		bytes: d.ReadBytes + d.WriteBytes,
+		ops:   d.ReadCount + d.WriteCount,
+	}
+}
+
+// busierThan orders candidates by bytes, then operations, then name so the
+// choice is deterministic across map iteration orders.
+func (c ioMatchCandidate) busierThan(o ioMatchCandidate) bool {
+	if c.bytes != o.bytes {
+		return c.bytes > o.bytes
+	}
+	if c.ops != o.ops {
+		return c.ops > o.ops
+	}
+	return c.name < o.name
 }
 
 // prefixRelated reports whether either identifier is a prefix of the other.
